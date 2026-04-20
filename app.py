@@ -1,6 +1,10 @@
 import streamlit as st
 import pandas as pd
 import numpy as np
+import folium
+from streamlit_folium import st_folium
+import requests
+import json
 
 st.set_page_config(page_title="India Physical Risk Explorer", layout="centered", initial_sidebar_state="collapsed")
 
@@ -60,10 +64,13 @@ html, body, [class*="css"] { font-family: 'Inter', sans-serif; }
 .unavail-card { background: #f8fafc; border: 1px dashed #cbd5e1; border-radius: 12px; padding: 1rem 1.1rem; display: flex; align-items: center; gap: 0.65rem; color: #94a3b8; font-size: 0.82rem; min-height: 130px; }
 .footer { text-align: center; color: #94a3b8; font-size: 0.77rem; margin-top: 3rem; padding-top: 1.5rem; border-top: 1px solid #e2e8f0; line-height: 1.8; }
 .footer a { color: #0085ca; text-decoration: none; }
+.map-section { border-radius: 12px; overflow: hidden; border: 1px solid #e2e8f0; margin-bottom: 1.25rem; }
+.map-label { font-size: 0.75rem; font-weight: 600; text-transform: uppercase; letter-spacing: 0.08em; color: #64748b; margin-bottom: 0.5rem; }
 </style>
 """, unsafe_allow_html=True)
 
-# ── LOAD DATA ──────────────────────────────────────────────────────────────────
+
+# ── LOAD SCORE DATA ───────────────────────────────────────────────────────────
 @st.cache_data
 def load_csv(filename):
     try:
@@ -78,6 +85,137 @@ df_heat     = load_csv("precomputed_heat_scores.csv")
 df_drought  = load_csv("precomputed_drought_scores.csv")
 df_flood    = load_csv("precomputed_flood_scores.csv")
 df_rainfall = load_csv("precomputed_rainfall_scores.csv")
+
+
+# ── LOAD DISTRICT GEOJSON (cached, fetched once from GitHub) ──────────────────
+@st.cache_data(show_spinner=False)
+def load_district_geojson():
+    """
+    Loads India district boundaries from datta07/INDIAN-SHAPEFILES on GitHub.
+    Free, no login, ~39MB. Cached after first load.
+    Returns a dict: { "DISTRICT_NAME|STATE_NAME": geojson_feature }
+    """
+    url = "https://raw.githubusercontent.com/datta07/INDIAN-SHAPEFILES/master/INDIA/INDIA_DISTRICTS.geojson"
+    try:
+        resp = requests.get(url, timeout=30)
+        gj   = resp.json()
+        # Build lookup dict — keys are "DISTRICT|STATE" uppercased
+        lookup = {}
+        for feature in gj["features"]:
+            props = feature.get("properties", {})
+            # Try common property name variants in this GeoJSON
+            dist  = (props.get("DISTRICT")  or props.get("district")  or
+                     props.get("NAME_2")     or props.get("Dist_Name") or "").upper().strip()
+            state = (props.get("ST_NM")      or props.get("state")     or
+                     props.get("NAME_1")     or props.get("State_Name") or "").upper().strip()
+            if dist:
+                lookup[f"{dist}|{state}"] = feature
+                lookup[dist] = feature          # fallback without state
+        return lookup, gj
+    except Exception as e:
+        return {}, None
+
+with st.spinner("Loading district boundaries..."):
+    district_lookup, full_geojson = load_district_geojson()
+
+
+# ── RISK COLOUR MAP ───────────────────────────────────────────────────────────
+RISK_COLOURS = {
+    "Very High": "#dc2626",
+    "High":      "#ea580c",
+    "Moderate":  "#ca8a04",
+    "Low":       "#16a34a",
+    "Very Low":  "#0284c7",
+}
+
+def risk_fill(level):
+    return RISK_COLOURS.get(level, "#94a3b8")
+
+
+# ── BUILD FOLIUM MAP ──────────────────────────────────────────────────────────
+def build_map(lat, lon, district, state, cyclone_level):
+    """
+    Returns a folium.Map with:
+      - District boundary polygon highlighted
+      - PIN centroid marker with circle
+    """
+    m = folium.Map(
+        location=[lat, lon],
+        zoom_start=9,
+        tiles="CartoDB positron",
+        zoom_control=True,
+        scrollWheelZoom=False,
+    )
+
+    # ── Try to find and draw district boundary ────────────────────────────────
+    dist_upper  = district.upper().strip()
+    state_upper = state.upper().strip()
+    feature     = (district_lookup.get(f"{dist_upper}|{state_upper}") or
+                   district_lookup.get(dist_upper))
+
+    fill_color = risk_fill(cyclone_level)
+
+    if feature:
+        folium.GeoJson(
+            data=feature,
+            name="District boundary",
+            style_function=lambda x, fc=fill_color: {
+                "fillColor":   fc,
+                "color":       fc,
+                "weight":      2.5,
+                "fillOpacity": 0.15,
+                "dashArray":   "4 2",
+            },
+            tooltip=folium.Tooltip(f"{district.title()}, {state.title()}",
+                                   sticky=False),
+        ).add_to(m)
+
+        # Fit map to district bounds
+        try:
+            coords = feature["geometry"]["coordinates"]
+            geom_type = feature["geometry"]["type"]
+            all_pts = []
+            if geom_type == "Polygon":
+                all_pts = coords[0]
+            elif geom_type == "MultiPolygon":
+                for poly in coords:
+                    all_pts.extend(poly[0])
+            if all_pts:
+                lons = [p[0] for p in all_pts]
+                lats = [p[1] for p in all_pts]
+                m.fit_bounds([[min(lats), min(lons)], [max(lats), max(lons)]])
+        except Exception:
+            pass
+    else:
+        # No boundary found — just centre on the point
+        m.location = [lat, lon]
+
+    # ── 10 km analysis radius circle ─────────────────────────────────────────
+    folium.Circle(
+        location=[lat, lon],
+        radius=10000,
+        color=fill_color,
+        weight=1.5,
+        fill=True,
+        fill_color=fill_color,
+        fill_opacity=0.08,
+        tooltip="10 km analysis radius",
+    ).add_to(m)
+
+    # ── PIN centroid marker ───────────────────────────────────────────────────
+    folium.CircleMarker(
+        location=[lat, lon],
+        radius=7,
+        color="white",
+        weight=2.5,
+        fill=True,
+        fill_color=fill_color,
+        fill_opacity=1.0,
+        tooltip=f"PIN centroid",
+    ).add_to(m)
+
+    return m
+
 
 # ── HELPERS ───────────────────────────────────────────────────────────────────
 def rc(level): return level.lower().replace(" ", "-")
@@ -115,6 +253,7 @@ def lookup(df, pin_str):
     rows = df[df["pincode"] == pin_str]
     return rows.iloc[0] if not rows.empty else None
 
+
 # ── HERO ───────────────────────────────────────────────────────────────────────
 st.markdown("""
 <div class="hero">
@@ -129,33 +268,51 @@ with col1:
 with col2:
     search = st.button("Search →", use_container_width=True, type="primary")
 
+
 # ── RENDER ─────────────────────────────────────────────────────────────────────
 def render_all(pin):
     pin_str = str(pin).strip().zfill(6)
     c = lookup(df_cyclone, pin_str)
     if c is None:
-        st.markdown('<div class="error-box">⚠️ PIN code not found. Please check and try again.</div>', unsafe_allow_html=True)
+        st.markdown('<div class="error-box">⚠️ PIN code not found. Please check and try again.</div>',
+                    unsafe_allow_html=True)
         return
 
-    st.markdown(f'<div class="location-pill">📍 {str(c["district"]).title()}, {str(c["statename"]).title()} &nbsp;·&nbsp; PIN {pin_str}</div>', unsafe_allow_html=True)
+    lat      = float(c["latitude"])
+    lon      = float(c["longitude"])
+    state    = str(c["statename"]).title()
+    district = str(c["district"]).title()
 
+    # Location pill
+    st.markdown(f'<div class="location-pill">📍 {district}, {state} &nbsp;·&nbsp; PIN {pin_str}</div>',
+                unsafe_allow_html=True)
+
+    # ── MAP ───────────────────────────────────────────────────────────────────
+    st.markdown('<div class="map-label">📍 Location Map</div>', unsafe_allow_html=True)
+    m = build_map(lat, lon, district, state, str(c["risk_level"]))
+    with st.container():
+        st_folium(m, width="100%", height=320, returned_objects=[])
+
+    st.markdown("<div style='margin-bottom:1rem'></div>", unsafe_allow_html=True)
+
+    # ── HAZARD CARDS ──────────────────────────────────────────────────────────
     h  = lookup(df_heat,     pin_str)
     d  = lookup(df_drought,  pin_str)
     fl = lookup(df_flood,    pin_str)
     r  = lookup(df_rainfall, pin_str)
 
     # Row 1: Cyclone · Heat · Drought
-    c_html = hazard_card("🌀", "Cyclone",  float(c["cyclone_score"]),  str(c["risk_level"]),  str(c["cyclone_explanation"]))
-    h_html = hazard_card("🌡️", "Heat",    float(h["heat_score"]),    str(h["risk_level"]),  str(h["heat_explanation"]))    if h  else unavail_card("🌡️", "Heat")
-    d_html = hazard_card("🏜️", "Drought", float(d["drought_score"]), str(d["risk_level"]),  str(d["drought_explanation"])) if d  else unavail_card("🏜️", "Drought")
+    c_html  = hazard_card("🌀","Cyclone", float(c["cyclone_score"]), str(c["risk_level"]), str(c["cyclone_explanation"]))
+    h_html  = hazard_card("🌡️","Heat",   float(h["heat_score"]),   str(h["risk_level"]), str(h["heat_explanation"]))    if h  else unavail_card("🌡️","Heat")
+    d_html  = hazard_card("🏜️","Drought",float(d["drought_score"]),str(d["risk_level"]), str(d["drought_explanation"])) if d  else unavail_card("🏜️","Drought")
     st.markdown(f'<div class="hazard-row-3">{c_html}{h_html}{d_html}</div>', unsafe_allow_html=True)
 
     # Row 2: Flood · Extreme Rainfall
-    fl_html = hazard_card("🌊", "Flood",            float(fl["flood_score"]),    str(fl["risk_level"]), str(fl["flood_explanation"]))    if fl else unavail_card("🌊", "Flood")
-    r_html  = hazard_card("🌧️", "Extreme Rainfall", float(r["rainfall_score"]),  str(r["risk_level"]),  str(r["rainfall_explanation"]))  if r  else unavail_card("🌧️", "Extreme Rainfall")
+    fl_html = hazard_card("🌊","Flood",           float(fl["flood_score"]),   str(fl["risk_level"]), str(fl["flood_explanation"]))    if fl else unavail_card("🌊","Flood")
+    r_html  = hazard_card("🌧️","Extreme Rainfall",float(r["rainfall_score"]), str(r["risk_level"]), str(r["rainfall_explanation"]))  if r  else unavail_card("🌧️","Extreme Rainfall")
     st.markdown(f'<div class="hazard-row-2">{fl_html}{r_html}</div>', unsafe_allow_html=True)
 
-    # Sub-indicator tabs
+    # ── SUB-INDICATOR TABS ────────────────────────────────────────────────────
     st.markdown("---")
     st.markdown("#### Sub-indicators")
     tabs = st.tabs(["🌀 Cyclone", "🌡️ Heat", "🏜️ Drought", "🌊 Flood", "🌧️ Rainfall"])
@@ -167,7 +324,7 @@ def render_all(pin):
             {ind_row("Max wind exposure (1-min sustained wind)", f"{float(c['max_wind']):.0f} kt", float(c['wind_norm']))}
             {ind_row("Distance-decayed exposure (wind / dist²)", f"{float(c['decay_score']):.4f}", float(c['decay_norm']))}
         </div>""", unsafe_allow_html=True)
-        st.caption("NOAA IBTrACS v04r00 NI basin (1842–2024) · Data consistent from 1980")
+        st.caption("NOAA IBTrACS v04r00 NI basin (1842–2024) · Consistent data from 1980")
 
     with tabs[1]:
         if h is not None:
@@ -218,12 +375,15 @@ def render_all(pin):
         else:
             st.info("Run `compute_rainfall_score.py` to generate extreme rainfall scores.")
 
+
 # ── RUN ────────────────────────────────────────────────────────────────────────
 if pin_input and (search or len(pin_input) == 6):
     if not pin_input.isdigit() or len(pin_input) != 6:
-        st.markdown('<div class="error-box">⚠️ Please enter a valid 6-digit PIN code (numbers only).</div>', unsafe_allow_html=True)
+        st.markdown('<div class="error-box">⚠️ Please enter a valid 6-digit PIN code (numbers only).</div>',
+                    unsafe_allow_html=True)
     else:
         render_all(pin_input)
+
 
 # ── METHODOLOGY ───────────────────────────────────────────────────────────────
 with st.expander("📐 Scoring methodology"):
@@ -262,6 +422,7 @@ with st.expander("📐 Scoring methodology"):
     <p style="font-size:0.79rem;color:#64748b;margin:0">All sub-indicators are min-max normalised (0–100) across all ~19,550 India PIN codes, then combined as a weighted sum. Risk levels: Very Low (0–20) · Low (20–40) · Moderate (40–60) · High (60–80) · Very High (80–100).</p>
     """, unsafe_allow_html=True)
 
+
 # ── FOOTER ─────────────────────────────────────────────────────────────────────
 st.markdown("""
 <div class="footer">
@@ -269,7 +430,10 @@ st.markdown("""
     Cyclone: <a href="https://www.ncei.noaa.gov/products/international-best-track-archive" target="_blank">NOAA IBTrACS v04r00 NI basin</a> (1842–2024) · Public domain<br>
     Heat: <a href="https://cds.climate.copernicus.eu/datasets/reanalysis-era5-land" target="_blank">ERA5-Land</a> via Copernicus CDS · Copernicus License<br>
     Drought + Rainfall: <a href="https://www.chc.ucsb.edu/data/chirps" target="_blank">CHIRPS v2.0</a> (1981–2024) · Public domain<br>
-    Flood: <a href="https://developers.google.com/earth-engine/datasets/catalog/JRC_CEMS_GLOFAS_FloodHazard_v2_1" target="_blank">JRC CEMS-GloFAS Flood Hazard v2.1</a> · <a href="https://global-surface-water.appspot.com/" target="_blank">JRC GSW 1.4</a> · <a href="https://www.usgs.gov/centers/eros/science/usgs-eros-archive-digital-elevation-shuttle-radar-topography-mission-srtm" target="_blank">USGS SRTM</a><br>
+    Flood: <a href="https://developers.google.com/earth-engine/datasets/catalog/JRC_CEMS_GLOFAS_FloodHazard_v2_1" target="_blank">JRC CEMS-GloFAS Flood Hazard v2.1</a> ·
+    <a href="https://global-surface-water.appspot.com/" target="_blank">JRC GSW 1.4</a> ·
+    <a href="https://www.usgs.gov/centers/eros/science/usgs-eros-archive-digital-elevation-shuttle-radar-topography-mission-srtm" target="_blank">USGS SRTM</a><br>
+    District boundaries: <a href="https://github.com/datta07/INDIAN-SHAPEFILES" target="_blank">datta07/INDIAN-SHAPEFILES</a> · Open data<br>
     PIN code coordinates: India Post via Open Government Data Platform India · GOI Open Data License<br><br>
     Scores are historical hazard estimates only and do not constitute official risk assessments.
 </div>""", unsafe_allow_html=True)
